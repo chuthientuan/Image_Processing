@@ -1,0 +1,10 @@
+#opencv-python
+#opencv-python
+#torch
+#cv2
+#numpy
+#pandas
+#ultralytics
+#tqdm
+#seaborn
+#streamlit
