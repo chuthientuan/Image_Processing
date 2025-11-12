@@ -1,75 +1,66 @@
 import streamlit as st
 import numpy as np
 from PIL import Image
-import matplotlib.pyplot as plt
 from scipy.ndimage import uniform_filter, maximum_filter, minimum_filter
+import cv2
+
+# --- CẤU HÌNH TRANG (PHẢI LÀ LỆNH STREAMLIT ĐẦU TIÊN) ---
+st.set_page_config(layout="wide")
 
 
-# --- TẤT CẢ CÁC HÀM XỬ LÝ ẢNH CỦA BẠN (giữ nguyên) ---
+# --- TẤT CẢ CÁC HÀM XỬ LÝ (TỰ VIẾT VÀ OPENCV) ---
+# (Các hàm này được giữ nguyên logic, chỉ gọi ra khi cần)
 
-def remove_shadow(gray_img, kernel_size=15, sigma=5, eps=1e-3):
-    """
-    Hàm tự viết để xóa bóng (từ code của bạn).
-    Sử dụng phép chia ảnh cho phiên bản mờ của nó.
-    """
+# --- Các hàm TỰ VIẾT (từ code của bạn) ---
+def remove_shadow_manual(gray_img, kernel_size=15, sigma=5, eps=1e-3):
     k = kernel_size // 2
     x, y = np.mgrid[-k:k + 1, -k:k + 1]
     kernel = np.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
     kernel /= kernel.sum()
-
     H, W = gray_img.shape
     padded = np.pad(gray_img, ((k, k), (k, k)), mode='reflect')
     blurred = np.zeros_like(gray_img, dtype=np.float32)
-    # Tối ưu hóa: Thay vì 2 vòng lặp 'for', chúng ta có thể dùng
-    # hàm 'filter2D' của OpenCV hoặc 'convolve2d' của Scipy
-    # Nhưng ta sẽ giữ nguyên logic của bạn để đảm bảo kết quả
     for i in range(kernel_size):
         for j in range(kernel_size):
             blurred += kernel[i, j] * padded[i:i + H, j:j + W]
-
     shadow_free = gray_img.astype(np.float32) / (blurred.astype(np.float32) / 255.0 + eps)
-    shadow_free = np.clip(shadow_free, 0, 255).astype(np.uint8)
-    return shadow_free
+    return np.clip(shadow_free, 0, 255).astype(np.uint8)
 
 
-def global_hist_threshold(image):
-    """
-    Hàm tự viết để tìm ngưỡng Otsu toàn cục.
-    """
+def hist_equalize_manual(gray_img):
+    hist = np.zeros(256, dtype=int)
+    for v in gray_img.flatten(): hist[v] += 1
+    cdf = np.cumsum(hist)
+    cdf_min = cdf[cdf > 0][0]
+    total_pixels = gray_img.size
+    lut = ((cdf - cdf_min) * 255 / (total_pixels - cdf_min)).clip(0, 255).astype(np.uint8)
+    return lut[gray_img]
+
+
+def global_hist_threshold_manual(image):
     hist = np.zeros(256, dtype=np.float32)
-    for val in image.ravel():
-        hist[val] += 1
+    for val in image.ravel(): hist[val] += 1
     hist /= hist.sum()
-
     bins = np.arange(256)
     total_mean = np.sum(bins * hist)
-    best_thresh = 0
-    max_between = -1
+    best_thresh, max_between = 0, -1
     w0_acc, sum0_acc = 0.0, 0.0
-
     for t in range(256):
-        w0_acc += hist[t]
+        w0_acc += hist[t];
         sum0_acc += t * hist[t]
-        w0 = w0_acc
-        w1 = 1.0 - w0
+        w0, w1 = w0_acc, 1.0 - w0_acc
         if w0 == 0 or w1 == 0: continue
-        mu0 = sum0_acc / w0
-        mu1 = (total_mean - sum0_acc) / w1
+        mu0, mu1 = sum0_acc / w0, (total_mean - sum0_acc) / w1
         between = w0 * w1 * (mu0 - mu1) ** 2
         if between > max_between:
-            max_between = between
+            max_between = between;
             best_thresh = t
-
-    # Logic của bạn: (image < best_thresh) -> người là màu trắng
-    # Điều này giả định nền sáng hơn người.
-    binary = (image < best_thresh).astype(np.uint8) * 255
-    return binary
+    # Giả định vật thể tối (người) trên nền sáng (trời, đường)
+    # nên dùng (image < best_thresh) -> người = 255
+    return (image < best_thresh).astype(np.uint8) * 255
 
 
-def morphology_open(img, ksize=2, iterations=1):
-    """
-    Hàm Mở (Opening).
-    """
+def morphology_open_manual(img, ksize=3, iterations=1):
     out = img.copy()
     for _ in range(iterations):
         eroded = minimum_filter(out, size=ksize, mode='reflect')
@@ -77,10 +68,7 @@ def morphology_open(img, ksize=2, iterations=1):
     return out
 
 
-def morphology_close(img, ksize=2, iterations=1):
-    """
-    Hàm Đóng (Closing).
-    """
+def morphology_close_manual(img, ksize=3, iterations=1):
     out = img.copy()
     for _ in range(iterations):
         dilated = maximum_filter(out, size=ksize, mode='reflect')
@@ -88,125 +76,278 @@ def morphology_close(img, ksize=2, iterations=1):
     return out
 
 
-# --- KẾT THÚC CÁC HÀM XỬ LÝ ẢNH ---
+def manual_blob_counter(binary_img, output_img, min_area, max_area, min_aspect, max_aspect):
+    H, W = binary_img.shape
+    binary_img_norm = binary_img.copy() // 255
+    labels = np.zeros_like(binary_img_norm, dtype=np.int32)
+    current_label = 1
+    count = 0
+    dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    for i in range(H):
+        for j in range(W):
+            if binary_img_norm[i, j] == 1 and labels[i, j] == 0:
+                stack = [(i, j)];
+                ys, xs = [], [];
+                labels[i, j] = current_label
+                while stack:
+                    y, x = stack.pop();
+                    ys.append(y);
+                    xs.append(x)
+                    for dy, dx in dirs:
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < H and 0 <= nx < W and binary_img_norm[ny, nx] == 1 and labels[ny, nx] == 0:
+                            labels[ny, nx] = current_label;
+                            stack.append((ny, nx))
+                if not xs or not ys: continue
+                x_min, x_max = min(xs), max(xs);
+                y_min, y_max = min(ys), max(ys)
+                w = (x_max - x_min + 1);
+                h = (y_max - y_min + 1);
+                area = w * h
+                if w == 0 or h == 0: continue
+                aspect_ratio = h / w
+                is_person_shape = (aspect_ratio > min_aspect) and (aspect_ratio < max_aspect)
+                if (min_area < area < max_area) and is_person_shape:
+                    cv2.rectangle(output_img, (x_min, y_min), (x_max, y_max), (255, 0, 0), 3)
+                    count += 1
+                current_label += 1
+    return output_img, count
 
 
-# --- LOGIC ỨNG DỤNG STREAMLIT ---
+# --- Các hàm DÙNG OPENCV ---
+def clahe_opencv(gray_img, clip_limit=2.0, tile_size=8):
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+    return clahe.apply(gray_img)
 
-st.set_page_config(layout="wide")
-st.title("Ứng dụng Xử lý ảnh - Đếm đối tượng trong ảnh camera giám sát")
 
-# 1. Tải ảnh lên
-uploaded_file = st.file_uploader("Chọn một file ảnh...", type=["jpg", "png", "jpeg"])
+def fixed_threshold_opencv(gray_img, thresh_val=127, invert=True):
+    mode = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+    _, binary = cv2.threshold(gray_img, thresh_val, 255, mode)
+    return binary
 
-if uploaded_file is not None:
-    # Đọc ảnh
-    img = Image.open(uploaded_file).convert('RGB')
-    img_np = np.array(img)  # H x W x 3
-    H, W = img_np.shape[:2]
 
-    # SỬA LỖI: Đã thay use_column_width bằng use_container_width
-    st.image(img_np, caption="Ảnh gốc", use_container_width=True)
+def otsu_threshold_opencv(gray_img, invert=True):
+    # Dùng THRESH_BINARY_INV để vật thể (tối) thành màu trắng
+    mode = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+    _, binary = cv2.threshold(gray_img, 0, 255, mode + cv2.THRESH_OTSU)
+    return binary
 
-    # Bắt đầu xử lý
-    with st.spinner("Đang xử lý ảnh... (các hàm tự viết có thể hơi chậm)"):
 
-        # --- 2. Chuyển xám ---
-        st.header("Bước 1: Chuyển đổi Grayscale")
-        gray = (0.299 * img_np[:, :, 0] + 0.587 * img_np[:, :, 1] + 0.114 * img_np[:, :, 2]).astype(np.uint8)
-        # SỬA LỖI: Đã thay use_column_width bằng use_container_width
-        st.image(gray, caption="Ảnh xám (Grayscale)", use_container_width=True)
+def adaptive_threshold_opencv(gray_img, block_size=21, C=5):
+    if block_size % 2 == 0: block_size += 1
+    return cv2.adaptiveThreshold(gray_img, 255,
+                                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY_INV, block_size, C)
 
-        # --- 3. Cân bằng Histogram ---
-        st.header("Bước 2: Cân bằng Histogram")
-        hist = np.zeros(256, dtype=int)
-        for v in gray.flatten():
-            hist[v] += 1
 
-        cdf = np.cumsum(hist)
-        cdf_min = cdf[cdf > 0][0]
-        total_pixels = gray.size
-        lut = ((cdf - cdf_min) * 255 / (total_pixels - cdf_min)).clip(0, 255).astype(np.uint8)
-        img_enhanced = lut[gray]
-        gray_eq = img_enhanced.copy()
-        # SỬA LỖI: Đã thay use_column_width bằng use_container_width
-        st.image(img_enhanced, caption="Ảnh sau khi cân bằng Histogram", use_container_width=True)
+def morphology_opencv(binary_img, op_type="Close", k_size=5, iterations=1):
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+    if op_type == "Close":
+        op = cv2.MORPH_CLOSE
+    elif op_type == "Open":
+        op = cv2.MORPH_OPEN
+    return cv2.morphologyEx(binary_img, op, kernel, iterations=iterations)
 
-        # --- 4. Xóa bóng ---
-        st.header("Bước 3: Xóa bóng")
-        shadow_free = remove_shadow(gray_eq, kernel_size=15, sigma=5)
-        # SỬA LỖI: Đã thay use_column_width bằng use_container_width
-        st.image(shadow_free, caption="Ảnh sau khi xóa bóng", use_container_width=True)
 
-        st.header("Bước 4: Phân ngưỡng Otsu")
-        segmented_otsu = global_hist_threshold(shadow_free)
-        st.image(segmented_otsu, caption="Ảnh nhị phân (Otsu)", use_container_width=True)
+def contours_counter_opencv(binary_img, output_img, min_area, max_area, min_aspect, max_aspect):
+    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    count = 0
+    for c in contours:
+        area = cv2.contourArea(c)
+        if min_area < area < max_area:
+            x, y, w, h = cv2.boundingRect(c)
+            aspect_ratio = h / w if w > 0 else 0
+            if min_aspect < aspect_ratio < max_aspect:
+                cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                count += 1
+    return output_img, count
 
-        st.header("Bước 5: Xử lý hình thái (Mở -> Đóng)")
-        opened = morphology_open(segmented_otsu, ksize=3, iterations=1)
-        closed = morphology_close(opened, ksize=3, iterations=1)
 
-        col1, col2 = st.columns(2)
-        col1.image(opened, caption="Ảnh sau khi Mở (Loại bỏ nhiễu)", use_container_width=True)
-        col2.image(closed, caption="Ảnh sau khi Đóng (Lấp đầy lỗ hổng)", use_container_width=True)
+def hog_detector_opencv(original_img_rgb, scale=1.05, win_stride=4):
+    hog = cv2.HOGDescriptor();
+    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    rects, _ = hog.detectMultiScale(original_img_rgb,
+                                    winStride=(win_stride, win_stride),
+                                    padding=(8, 8),
+                                    scale=scale)
+    output_img = original_img_rgb.copy()
+    for (x, y, w, h) in rects:
+        cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 0, 255), 3)
+    return output_img, len(rects)
 
-        st.header("Bước 6: Tìm và Đếm đối tượng")
-        H, W = closed.shape
-        binary_img = closed.copy() // 255
 
-        output = np.stack([img_enhanced] * 3, axis=-1)
+# --- GIAO DIỆN STREAMLIT ---
 
-        min_area, max_area = 3000, 50000
-        min_aspect_ratio = 1.5
-        max_aspect_ratio = 3.5
+# --- THANH BÊN (SIDEBAR) ---
+st.sidebar.title("Cấu hình Pipeline")
+uploaded_file = st.sidebar.file_uploader("1. Tải ảnh lên", type=["jpg", "png", "jpeg"])
 
-        count = 0
-        labels = np.zeros_like(binary_img, dtype=np.int32)
-        current_label = 1
-        dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+# --- CÁC BƯỚC (CHỈ HIỂN THỊ KHI ĐÃ TẢI ẢNH) ---
+if uploaded_file:
+    # --- Bước 1: Tiền xử lý & Xám ---
+    with st.sidebar.expander("Bước 1: Tiền xử lý & Xám", expanded=True):
+        method_enhance = st.selectbox("Phương pháp Cải thiện:", [
+            "Chỉ chuyển xám (Không làm gì)",
+            "Cân bằng Histogram (Tự viết)",
+            "CLAHE (OpenCV)",
+            "Xóa bóng (Tự viết)"
+        ])
+        # Tham số cho CLAHE
+        if method_enhance == "CLAHE (OpenCV)":
+            clip_limit = st.slider("Clip Limit", 1.0, 10.0, 2.0)
+            tile_size = st.slider("Tile Size", 2, 16, 8)
+        # Tham số cho Xóa bóng
+        elif method_enhance == "Xóa bóng (Tự viết)":
+            k_shadow = st.slider("Kernel Size", 5, 35, 15, 2)
+            s_shadow = st.slider("Sigma", 1.0, 20.0, 5.0)
 
-        for i in range(H):
-            for j in range(W):
-                if binary_img[i, j] == 1 and labels[i, j] == 0:
-                    stack = [(i, j)]
-                    ys, xs = [], []
-                    labels[i, j] = current_label
-                    while stack:
-                        y, x = stack.pop()
-                        ys.append(y)
-                        xs.append(x)
-                        for dy, dx in dirs:
-                            ny, nx = y + dy, x + dx
-                            if 0 <= ny < H and 0 <= nx < W:
-                                if binary_img[ny, nx] == 1 and labels[ny, nx] == 0:
-                                    labels[ny, nx] = current_label
-                                    stack.append((ny, nx))
+    # --- Bước 2: Phân ngưỡng ---
+    with st.sidebar.expander("Bước 2: Phân ngưỡng", expanded=True):
+        method_thresh = st.selectbox("Phương pháp Phân ngưỡng:", [
+            "Phân ngưỡng Thích nghi (OpenCV)",
+            "Otsu (Tự viết)",
+            "Otsu (OpenCV)",
+            "Ngưỡng cố định (OpenCV)"
+        ])
+        # Tham số cho Thích nghi
+        if method_thresh == "Phân ngưỡng Thích nghi (OpenCV)":
+            block_size = st.slider("Block Size", 3, 51, 21, 2)
+            C_val = st.slider("C Value", 1, 15, 5)
+        # Tham số cho Ngưỡng cố định
+        elif method_thresh == "Ngưỡng cố định (OpenCV)":
+            thresh_val = st.slider("Ngưỡng", 0, 255, 127)
 
-                    if not xs or not ys: continue
+        # Tất cả các phương pháp trừ 'adaptive' đều có thể đảo ngược
+        invert_thresh = st.checkbox("Đảo ngược (Vật thể tối -> Trắng)", value=True)
 
-                    x_min, x_max = min(xs), max(xs)
-                    y_min, y_max = min(ys), max(ys)
+    # --- Bước 3: Xử lý hình thái ---
+    with st.sidebar.expander("Bước 3: Xử lý hình thái", expanded=True):
+        method_morph = st.selectbox("Phương pháp Hình thái:", [
+            "Đóng (Close) (OpenCV)",
+            "Mở (Open) (OpenCV)",
+            "Đóng -> Mở (OpenCV)",  # <-- ĐÃ THÊM
+            "Mở -> Đóng (Tự viết - Scipy)"
+        ])
+        k_morph = st.slider("Kernel Size", 3, 21, 5, 2)
+        iter_morph = st.slider("Iterations", 1, 5, 1)
 
-                    w = (x_max - x_min + 1)
-                    h = (y_max - y_min + 1)
-                    area = w * h
+    # --- Bước 4: Đếm đối tượng ---
+    with st.sidebar.expander("Bước 4: Đếm đối tượng", expanded=True):
+        method_count = st.selectbox("Phương pháp Đếm:", [
+            "Đếm Contours (OpenCV)",
+            "Đếm Blob (Tự viết - DFS)",
+            "Phát hiện HOG (OpenCV)"
+        ])
 
-                    if w == 0 or h == 0: continue
-                    aspect_ratio = h / w
+        # HOG có tham số riêng
+        if method_count == "Phát hiện HOG (OpenCV)":
+            scale = st.slider("Hệ số tỷ lệ (Scale)", 1.01, 2.0, 1.05, 0.01)
+            win_stride = st.select_slider("Bước nhảy (Stride)", [4, 8, 16], 8)
+        # Các phương pháp đếm blob có tham số lọc
+        else:
+            st.write("Lọc đối tượng:")
+            c1, c2 = st.columns(2)
+            min_area = c1.number_input("Min Area", 100, 20000, 3000)
+            max_area = c2.number_input("Max Area", 20000, 200000, 50000)
+            min_aspect = c1.number_input("Min Aspect (H/W)", 0.1, 5.0, 1.5, 0.1)
+            max_aspect = c2.number_input("Max Aspect (H/W)", 1.0, 10.0, 3.5, 0.1)
 
-                    is_person_shape = (aspect_ratio > min_aspect_ratio) and (aspect_ratio < max_aspect_ratio)
-
-                    if (min_area < area < max_area) and is_person_shape:
-                        # Vẽ hộp (theo logic của bạn)
-                        output[y_min:y_min + 2, x_min:x_max + 1] = [255, 0, 0]  # top
-                        output[y_max:y_max + 1, x_min:x_max + 1] = [255, 0, 0]  # bottom
-                        output[y_min:y_max + 1, x_min:x_min + 2] = [255, 0, 0]  # left
-                        output[y_min:y_max + 1, x_max:x_max + 1] = [255, 0, 0]  # right
-                        count += 1
-                    current_label += 1
-
-        st.success(f"Hoàn thành! Đã phát hiện tổng cộng: {count} đối tượng")
-        st.image(output, caption=f"Kết quả cuối cùng: {count} đối tượng", use_container_width=True)
+    # --- NÚT XỬ LÝ ---
+    run_button = st.sidebar.button("Bắt đầu xử lý Pipeline", type="primary", use_container_width=True)
 
 else:
-    st.info("Vui lòng tải một ảnh lên để bắt đầu xử lý.")
+    # --- TRANG CHÍNH (KHI CHƯA TẢI ẢNH) ---
+    st.title("Giới thiệu Ứng dụng Pipeline Xử lý ảnh")
+    st.image("https://placehold.co/1200x400/20325A/FFFFFF?text=Pipeline+X%E1%BB%AD+L%C3%BD+%E1%BA%A2nh",
+             use_container_width=True)
+    st.info("Vui lòng tải một ảnh lên ở thanh bên trái để bắt đầu cấu hình pipeline.")
+    run_button = False  # Không chạy gì cả
+
+# --- VÒNG LẶP XỬ LÝ CHÍNH (KHI NHẤN NÚT) ---
+if run_button:
+    # --- Khởi tạo ảnh ---
+    img_pil = Image.open(uploaded_file).convert('RGB')
+    img_np_rgb = np.array(img_pil)
+    img_np_gray = cv2.cvtColor(img_np_rgb, cv2.COLOR_RGB2GRAY)
+
+    st.title("Kết quả xử lý Pipeline")
+    st.image(img_np_rgb, caption="Ảnh gốc", use_container_width=True)
+
+    # --- Xử lý Bước 1: Cải thiện & Xám ---
+    st.header("Bước 1: Tiền xử lý & Xám")
+    with st.spinner(f"Đang áp dụng: {method_enhance}..."):
+        if method_enhance == "Cân bằng Histogram (Tự viết)":
+            enhanced_image = hist_equalize_manual(img_np_gray)
+        elif method_enhance == "CLAHE (OpenCV)":
+            enhanced_image = clahe_opencv(img_np_gray, clip_limit, tile_size)
+        elif method_enhance == "Xóa bóng (Tự viết)":
+            enhanced_image = remove_shadow_manual(img_np_gray, k_shadow, s_shadow)
+        else:  # "Chỉ chuyển xám"
+            enhanced_image = img_np_gray
+
+    st.image(enhanced_image, caption=f"Kết quả Bước 1: {method_enhance}", use_container_width=True, clamp=True)
+
+    # --- Xử lý Bước 4 (HOG) - Chạy riêng ---
+    if method_count == "Phát hiện HOG (OpenCV)":
+        st.header("Bước 2 & 3: Bỏ qua (HOG chạy trên ảnh gốc)")
+        st.header("Bước 4: Đếm đối tượng")
+        st.warning("Phương pháp HOG chạy trực tiếp trên ảnh gốc, bỏ qua các bước Tiền xử lý, Phân ngưỡng và Hình thái.")
+
+        with st.spinner(f"Đang áp dụng: {method_count}..."):
+            final_image, count = hog_detector_opencv(img_np_rgb, scale, win_stride)
+
+        st.success(f"Hoàn thành! Đã phát hiện tổng cộng: {count} đối tượng")
+        st.image(final_image, caption=f"Kết quả cuối cùng (HOG): {count} đối tượng", use_container_width=True)
+
+    # --- Xử lý Pipeline thông thường (cho các phương pháp đếm blob) ---
+    else:
+        # --- Xử lý Bước 2: Phân ngưỡng ---
+        st.header("Bước 2: Phân ngưỡng")
+        with st.spinner(f"Đang áp dụng: {method_thresh}..."):
+            if method_thresh == "Phân ngưỡng Thích nghi (OpenCV)":
+                thresholded_image = adaptive_threshold_opencv(enhanced_image, block_size, C_val)
+            elif method_thresh == "Otsu (Tự viết)":
+                thresholded_image = global_hist_threshold_manual(enhanced_image)
+            elif method_thresh == "Otsu (OpenCV)":
+                thresholded_image = otsu_threshold_opencv(enhanced_image, invert_thresh)
+            elif method_thresh == "Ngưỡng cố định (OpenCV)":
+                thresholded_image = fixed_threshold_opencv(enhanced_image, thresh_val, invert_thresh)
+
+        st.image(thresholded_image, caption=f"Kết quả Bước 2: {method_thresh}", use_container_width=True, clamp=True)
+
+        # --- Xử lý Bước 3: Hình thái ---
+        st.header("Bước 3: Xử lý hình thái")
+        with st.spinner(f"Đang áp dụng: {method_morph}..."):
+            if method_morph == "Mở -> Đóng (Tự viết - Scipy)":
+                opened = morphology_open_manual(thresholded_image, k_morph, iter_morph)
+                morphed_image = morphology_close_manual(opened, k_morph, iter_morph)
+            elif method_morph == "Đóng (Close) (OpenCV)":
+                morphed_image = morphology_opencv(thresholded_image, "Close", k_morph, iter_morph)
+            elif method_morph == "Mở (Open) (OpenCV)":
+                morphed_image = morphology_opencv(thresholded_image, "Open", k_morph, iter_morph)
+            elif method_morph == "Đóng -> Mở (OpenCV)":  # <-- ĐÃ THÊM
+                closed = morphology_opencv(thresholded_image, "Close", k_morph, iter_morph)
+                morphed_image = morphology_opencv(closed, "Open", k_morph, iter_morph)
+
+        st.image(morphed_image, caption=f"Kết quả Bước 3: {method_morph}", use_container_width=True, clamp=True)
+
+        # --- Xử lý Bước 4: Đếm ---
+        st.header("Bước 4: Đếm đối tượng")
+        # Tạo ảnh nền để vẽ (từ ảnh đã cải thiện)
+        output_display_img = cv2.cvtColor(enhanced_image, cv2.COLOR_GRAY2RGB)
+
+        with st.spinner(f"Đang áp dụng: {method_count}..."):
+            if method_count == "Đếm Contours (OpenCV)":
+                final_image, count = contours_counter_opencv(
+                    morphed_image, output_display_img,
+                    min_area, max_area, min_aspect, max_aspect
+                )
+            elif method_count == "Đếm Blob (Tự viết - DFS)":
+                final_image, count = manual_blob_counter(
+                    morphed_image, output_display_img,
+                    min_area, max_area, min_aspect, max_aspect
+                )
+
+        st.success(f"Hoàn thành! Đã phát hiện tổng cộng: {count} đối tượng")
+        st.image(final_image, caption=f"Kết quả cuối cùng ({method_count}): {count} đối tượng",
+                 use_container_width=True)
